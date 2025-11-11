@@ -1,0 +1,6 @@
+{
+    "model_name": "nomic-embed-text",
+    "search_results_limit": 50,
+    "batch_size": 10,
+    "ollama_host": "http://localhost:11434"
+}
