@@ -5,6 +5,6 @@ description = "Anki extension for vector embeddings and hybrid search"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "chromadb>=0.4.0",
     "ollama>=0.1.0",
+    "sqlite-vec>=0.1.6",
 ]
