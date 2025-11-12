@@ -5,11 +5,13 @@ from pathlib import Path
 from typing import List, Tuple
 from typing_extensions import Iterator
 import itertools
+from types import MethodType
 
 try:
     from aqt import mw, gui_hooks
     from aqt.qt import *
     from aqt.utils import showInfo, tooltip
+    from aqt.browser import Browser
     from anki import hooks
     IN_ANKI = True
 except ImportError:
@@ -102,7 +104,7 @@ class VectorEmbeddingManager:
         self.conn.commit()
 
     def search(self, query: str, n_results: int = 20) -> List[int]:
-        query_embedding = ollama.embed(model=self.model_name, text=query)["embeddings"][0]
+        query_embedding = ollama.embed(model=self.model_name, input=query)["embeddings"][0]
         query_str = str(query_embedding)
 
         self.db.execute(
@@ -113,14 +115,48 @@ class VectorEmbeddingManager:
 
         return [row[0] for row in results]
 
+    def note_ids_to_card_ids(self, note_ids: List[int]) -> List[int]:
+        if not note_ids:
+            return []
+        placeholders = ','.join('?' * len(note_ids))
+        self.db.execute(f"SELECT id FROM cards WHERE nid IN ({placeholders})", note_ids)
+        return [row[0] for row in self.db.fetchall()]
+
+def wrap_vec_search(txt):
+    if not isinstance(txt, str):
+        return txt
+    parts = txt.split("vec:", 1)
+    regular_query = parts[0].strip()
+    if len(parts) > 1:
+        vec_query = parts[1].strip()
+        note_ids = manager.search(vec_query, n_results=100)
+        card_ids = manager.note_ids_to_card_ids(note_ids)
+        return f"{regular_query} (" + " OR ".join(f"cid:{cid}" for cid in card_ids) + ")"
+    return regular_query
+
 if IN_ANKI:
+    _original_table_search = None
+
+    def patched_table_search(self, txt: str) -> None:
+        global manager
+        transformed_txt = wrap_vec_search(txt)
+        return _original_table_search(self, transformed_txt)
+
     def init_hook():
-        global manager, config
+        global manager, config, _original_table_search
 
         config = mw.addonManager.getConfig("ankivec")
         manager = VectorEmbeddingManager(config["model_name"], mw.col.path)
 
+    def browser_did_init(browser):
+        global _original_table_search
+        from aqt.browser.table.table import Table
+        if _original_table_search is None:
+            _original_table_search = Table.search
+            Table.search = patched_table_search
+
     gui_hooks.main_window_did_init.append(init_hook)
+    gui_hooks.browser_will_show.append(browser_did_init)
 
     def handle_deleted(_, note_ids):
         pass
