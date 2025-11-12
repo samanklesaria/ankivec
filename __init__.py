@@ -126,6 +126,10 @@ class VectorEmbeddingManager:
 
         return [row[0] for row in results]
 
+    def delete_notes(self, note_ids: list[int]) -> None:
+        self.db.execute("DELETE FROM ankivec_vec WHERE note_id IN ?", (tuple(note_ids),))
+        self.db.commit()
+
 if IN_ANKI:
     _original_table_search = None
 
@@ -161,6 +165,6 @@ if IN_ANKI:
     gui_hooks.browser_will_show.append(browser_did_init)
 
     def handle_deleted(_, note_ids):
-        pass
+        manager.delete_notes(note_ids)
 
     hooks.notes_will_be_deleted.append(handle_deleted)
