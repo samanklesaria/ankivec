@@ -1,7 +1,7 @@
 {
   "model_name": "nomic-embed-text",
   "embedding_size": 768,
-  "search_results_limit": 1,
+  "search_results_limit": 20,
   "batch_size": 10,
   "ollama_host": "http://localhost:11434"
 }

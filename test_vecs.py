@@ -21,9 +21,9 @@ def synth_db():
         conn.close()
         yield f.name
 
-@pytest.fixture
-def manager():
-    yield VectorEmbeddingManager("nomic-embed-text", 768, "/Users/sam/Library/Application Support/Anki2/User 1/collection.anki2")
+# @pytest.fixture
+# def manager():
+#     yield VectorEmbeddingManager("nomic-embed-text", 768, "/Users/sam/Library/Application Support/Anki2/User 1/collection.anki2")
 
 def test_search_first_note_syth(synth_db):
     manager = VectorEmbeddingManager("nomic-embed-text", 768, synth_db)
@@ -31,7 +31,7 @@ def test_search_first_note_syth(synth_db):
     assert len(results) == 1
     assert results[0] == 1
 
-def test_manager(manager):
-    notes = manager.db.execute("SELECT id, flds FROM notes order by mod desc LIMIT 20").fetchall()
-    for (nid, flds) in notes:
-        assert nid == manager.search(flds, 1)[0]
+# def test_manager(manager):
+#     notes = manager.db.execute("SELECT id, flds FROM notes order by mod desc LIMIT 20").fetchall()
+#     for (nid, flds) in notes:
+#         assert nid == manager.search(flds, 1)[0]

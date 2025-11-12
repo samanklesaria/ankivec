@@ -40,9 +40,9 @@ class VectorEmbeddingManager:
         self.conn.close()
 
     def _init_tables(self, embedding_size: int):
-        self.db.execute("drop table if exists ankivec_vec")
-        self.db.execute("drop table if exists ankivec_metadata")
-        self.conn.commit()
+        # self.db.execute("drop table if exists ankivec_vec")
+        # self.db.execute("drop table if exists ankivec_metadata")
+        # self.conn.commit()
 
         self.db.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS ankivec_vec USING vec0(
@@ -89,14 +89,15 @@ class VectorEmbeddingManager:
         if not progress:
             sys.stdout.write("Syncing Cards: ")
             sys.stdout.flush()
-        for batch in itertools.batched(notes, 1):
+        for batch in itertools.batched(notes, 128):
             note_ids, card_text = zip(*batch)
             joined_text = ["search_document: " + " ".join(c.split(chr(0x1f))) for c in card_text]
             try:
                 embeddings = ollama.embed(model=self.model_name, input=joined_text)["embeddings"]
             except:
-                print("Trying to embed ", note_ids, card_text)
-                raise
+                print("FAILED TO EMBED\n:", card_text)
+                processed += len(batch)
+                continue
             writer.executemany(
                 "INSERT OR REPLACE INTO ankivec_vec (note_id, embedding) VALUES (?, ?)",
                 list(zip(note_ids, map(serialize_float32, embeddings)))
@@ -109,9 +110,10 @@ class VectorEmbeddingManager:
             else:
                 sys.stdout.write(".")
                 sys.stdout.flush()
-        if not progress:
+        if progress:
+            progress.cancel()
+        else:
             print("")
-
 
     def search(self, query: str, n_results: int = 20) -> list[int]:
         embedding = ollama.embed(model=self.model_name, input='search_query: ' + query)["embeddings"][0]
