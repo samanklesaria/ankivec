@@ -13,9 +13,25 @@ except ImportError:
     IN_ANKI = False
 
 if IN_ANKI:
-    # Hack to make anki use the virtual environment
+    import platform
+    import subprocess
+    system = platform.system()
     ADDON_ROOT_DIR = Path(__file__).parent
+
+    # Install dependencies with uv
+    if system == "Windows":
+        raise NotImplementedError("Windows is not yet supported")
+    elif system == "Darwin":
+        uv_path = "/Applications/Anki.app/Contents/MacOS/uv"
+    elif system == "Linux":
+        raise NotImplementedError("Linux is not yet supported")
+    else:
+        raise NotImplementedError("Unknown system")
+    subprocess.check_call([uv_path, "sync", "--project", str(ADDON_ROOT_DIR)], cwd=str(ADDON_ROOT_DIR))
+
+    # Hack to make anki use the virtual environment
     sys.path.append(os.path.join(ADDON_ROOT_DIR, ".venv/lib/python3.13/site-packages/"))
+
 
 import sqlite3
 import sqlite_vec
@@ -41,10 +57,6 @@ class VectorEmbeddingManager:
         self.conn.close()
 
     def _init_tables(self):
-        # self.db.execute("drop table if exists ankivec_vec")
-        # self.db.execute("drop table if exists ankivec_metadata")
-        # self.conn.commit()
-
         self.db.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS ankivec_vec USING vec0(
                 note_id INTEGER PRIMARY KEY,
@@ -53,16 +65,23 @@ class VectorEmbeddingManager:
         """)
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS ankivec_metadata (
-                key TEXT PRIMARY KEY,
-                value INTEGER
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                mod INTEGER,
+                model_name TEXT
             )
         """)
         self.conn.commit()
 
     def _sync(self):
+        stored_model_name, stored_mod = (self.db.execute("SELECT model_name, mod FROM ankivec_metadata WHERE id = 1").fetchone()
+             or (None, 0))
+
+        if self.model_name != stored_model_name:
+            if IN_ANKI:
+                tooltip("Model changed. Reindexing all cards...", parent=mw)
+            stored_mod = 0
+
         # Check if notes table has been modified since last sync
-        stored_mod_row = self.db.execute("SELECT value FROM ankivec_metadata WHERE key = ?", ("notes_max_mod",)).fetchone()
-        stored_mod = stored_mod_row[0] if stored_mod_row else 0
         total, notes_mod = self.db.execute("SELECT COUNT(), max(mod) FROM notes where mod > ?", (stored_mod,)).fetchone()
         if total == 0: return
         self.db.execute("delete from ankivec_vec where note_id in (SELECT id FROM notes where mod > ?)", (stored_mod,))
@@ -80,16 +99,9 @@ class VectorEmbeddingManager:
         self.add_cards(notes_to_add, progress)
 
         # Store the latest modification time
-        self.db.execute("INSERT OR REPLACE INTO ankivec_metadata (key, value) VALUES (?, ?)",
-                       ("notes_max_mod", notes_mod))
+        self.db.execute("INSERT OR REPLACE INTO ankivec_metadata (id, mod, model_name) VALUES (?, ?, ?)",
+                       (1, notes_mod, self.model_name))
         self.conn.commit()
-
-    def reindex_all(self):
-        self.db.execute("drop table ankivec_vec")
-        self.db.execute("drop table ankivec_metadata")
-        self.conn.commit()
-        self._init_tables()
-        self._sync()
 
     def add_cards(self, notes, progress):
         processed = 0
@@ -164,23 +176,18 @@ if IN_ANKI:
             _original_table_search = Table.search
             Table.search = patched_table_search
 
-    def handle_config_update(new_config):
+    def handle_config_update():
         global manager, config
-        old_model = config.get("model_name")
-        config = new_config
-        if old_model != config["model_name"]:
-            manager.reindex_all()
-            tooltip("Model changed. Reindexing all cards...", parent=mw)
+        manager.reindex_all()
+        tooltip("Model changed. Reindexing all cards...", parent=mw)
 
     gui_hooks.main_window_did_init.append(init_hook)
     gui_hooks.browser_will_show.append(browser_did_init)
-    gui_hooks.addon_config_editor_will_save_changes.append(lambda config_data, addon_name:
-        handle_config_update(config_data) if addon_name == "ankivec" else None)
 
     def handle_deleted(_, note_ids):
         manager.delete_notes(note_ids)
 
-    def handle_saved(_, note):
+    def handle_saved(note):
         card_text = " ".join(note.fields)
         joined_text = "search_document: " + card_text
         try:
@@ -195,4 +202,4 @@ if IN_ANKI:
 
     hooks.notes_will_be_deleted.append(handle_deleted)
     hooks.note_will_be_added.append(handle_saved)
-    hooks.note_did_update_fields.append(handle_saved)
+    hooks.note_will_flush.append(handle_saved)
