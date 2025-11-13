@@ -13,7 +13,6 @@ Anki extension that creates vector embeddings for cards using Ollama and enables
 
 1. **Anki** (version 2.1.45+)
 2. **Ollama** installed and running locally
-3. The **uv+** package manager
 
 ### Install Ollama
 

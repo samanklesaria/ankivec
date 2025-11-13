@@ -5,8 +5,7 @@ from pathlib import Path
 try:
     from aqt import mw, gui_hooks
     from aqt.qt import *
-    from aqt.utils import showInfo, tooltip
-    from aqt.browser import Browser
+    from aqt.utils import tooltip
     from anki import hooks
     IN_ANKI = True
 except ImportError:
@@ -32,61 +31,42 @@ if IN_ANKI:
     # Hack to make anki use the virtual environment
     sys.path.append(os.path.join(ADDON_ROOT_DIR, ".venv/lib/python3.13/site-packages/"))
 
-import sqlite3
-import sqlite_vec
-from sqlite_vec import serialize_float32
+import chromadb
 import ollama
 import itertools
 
 class VectorEmbeddingManager:
-    def __init__(self, model_name: str, embedding_size: int, db_path: str):
+    def __init__(self, model_name: str, collection_path: str, db):
         self.model_name = model_name
-        self.embedding_size = embedding_size
+        self.db = db
 
-        # Use direct sqlite3 connection to Anki's database
-        self.conn = sqlite3.connect(db_path)
-        self.conn.enable_load_extension(True)
-        sqlite_vec.load(self.conn)
-        self.conn.enable_load_extension(False)
-        self.db = self.conn.cursor()
-        self._init_tables()
+        self.client = chromadb.PersistentClient(path=collection_path)
+        self.collection = self.client.get_or_create_collection(
+            name="ankivec",
+            metadata={"model_name": model_name}
+        )
         self._sync()
 
-    def __del__(self):
-        self.conn.close()
-
-    def _init_tables(self):
-        self.db.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS ankivec_vec USING vec0(
-                note_id INTEGER PRIMARY KEY,
-                embedding float[{self.embedding_size}]
-            )
-        """)
-        self.db.execute("""
-            CREATE TABLE IF NOT EXISTS ankivec_metadata (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                mod INTEGER,
-                model_name TEXT
-            )
-        """)
-        self.conn.commit()
-
     def _sync(self):
-        stored_model_name, stored_mod = (self.db.execute("SELECT model_name, mod FROM ankivec_metadata WHERE id = 1").fetchone()
-             or (None, 0))
+        stored_model_name = self.collection.metadata.get("model_name")
+        stored_mod = int(self.collection.metadata.get("mod", 0))
 
         if self.model_name != stored_model_name:
             if IN_ANKI:
                 tooltip("Model changed. Reindexing all cards...", parent=mw)
-            self.db.execute("drop table ankivec_vec")
-            self._init_tables()
+            self.client.delete_collection("ankivec")
+            self.collection = self.client.create_collection(
+                name="ankivec",
+                metadata={"model_name": self.model_name}
+            )
             stored_mod = 0
 
         # Check if notes table has been modified since last sync
-        total, notes_mod = self.db.execute("SELECT COUNT(), max(mod) FROM notes where mod > ?", (stored_mod,)).fetchone()
+        total, notes_mod = self.db.first("SELECT COUNT(), max(mod) FROM notes where mod > ?", stored_mod)
         if total == 0: return
-        self.db.execute("delete from ankivec_vec where note_id in (SELECT id FROM notes where mod > ?)", (stored_mod,))
-        notes_to_add = self.db.execute("SELECT id, flds FROM notes where mod > ?", (stored_mod,))
+
+        total = self.db.scalar("SELECT count() FROM notes where mod > ?", stored_mod)
+        notes_to_add = self.db.execute("SELECT id, flds FROM notes where mod > ?", stored_mod)
 
         if IN_ANKI:
             progress = QProgressDialog("Syncing cards to vector database...", "Cancel", 0, total, mw)
@@ -100,13 +80,10 @@ class VectorEmbeddingManager:
         self.add_cards(notes_to_add, progress)
 
         # Store the latest modification time
-        self.db.execute("INSERT OR REPLACE INTO ankivec_metadata (id, mod, model_name) VALUES (?, ?, ?)",
-                       (1, notes_mod, self.model_name))
-        self.conn.commit()
+        self.collection.modify(metadata={"model_name": self.model_name, "mod": str(notes_mod or 0)})
 
     def add_cards(self, notes, progress):
         processed = 0
-        writer = self.conn.cursor()
         for batch in itertools.batched(notes, 128):
             note_ids, card_text = zip(*batch)
             joined_text = ["search_document: " + " ".join(c.split(chr(0x1f))) for c in card_text]
@@ -116,10 +93,12 @@ class VectorEmbeddingManager:
                 print("FAILED TO EMBED\n:", card_text)
                 processed += len(batch)
                 continue
-            writer.executemany(
-                "INSERT INTO ankivec_vec (note_id, embedding) VALUES (?, ?)",
-                list(zip(note_ids, map(serialize_float32, embeddings)))
+
+            self.collection.upsert(
+                ids=[str(i) for i in note_ids],
+                embeddings=embeddings
             )
+
             processed += len(batch)
             if progress:
                 progress.setValue(processed)
@@ -134,17 +113,15 @@ class VectorEmbeddingManager:
             print("")
 
     def search(self, query: str, n_results: int = 20) -> list[int]:
-        embedding = ollama.embed(model=self.model_name, input='search_query: ' + query)["embeddings"][0]
-        self.db.execute(
-            "SELECT note_id FROM ankivec_vec WHERE embedding MATCH ? and k = ?",
-            (serialize_float32(embedding), n_results)
+        embeddings = ollama.embed(model=self.model_name, input='search_query: ' + query)["embeddings"]
+        results = self.collection.query(
+            query_embeddings=embeddings,
+            n_results=n_results
         )
-        results = self.db.fetchall()
-        return [row[0] for row in results]
+        return [int(id) for id in results["ids"][0]]
 
     def delete_notes(self, note_ids: list[int]) -> None:
-        self.db.execute("DELETE FROM ankivec_vec WHERE note_id IN ?", (tuple(note_ids),))
-        self.db.commit()
+        self.collection.delete(ids=[str(i) for i in note_ids])
 
 if IN_ANKI:
     _original_table_search = None
@@ -168,7 +145,8 @@ if IN_ANKI:
     def init_hook():
         global manager, config, _original_table_search
         config = mw.addonManager.getConfig("ankivec")
-        manager = VectorEmbeddingManager(config["model_name"], config["embedding_size"], mw.col.path)
+        collection_path = str(Path(mw.col.path).parent / "ankivec_chromadb")
+        manager = VectorEmbeddingManager(config["model_name"], collection_path, mw.col.db)
 
     def browser_did_init(browser):
         global _original_table_search
@@ -187,12 +165,11 @@ if IN_ANKI:
         card_text = " ".join(note.fields)
         joined_text = "search_document: " + card_text
         embedding = ollama.embed(model=manager.model_name, input=joined_text)["embeddings"][0]
-        manager.db.execute("delete from ankivec_vec where note_id = ?", (note.id,))
-        manager.db.execute(
-            "INSERT INTO ankivec_vec (note_id, embedding) VALUES (?, ?)",
-            (note.id, serialize_float32(embedding))
+        manager.collection.upsert(
+            ids=[str(note.id)],
+            embeddings=[embedding],
+            metadatas=[{"note_id": note.id}]
         )
-        manager.conn.commit()
 
     hooks.notes_will_be_deleted.append(handle_deleted)
     hooks.note_will_be_added.append(handle_saved)
